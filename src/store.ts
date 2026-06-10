@@ -5,15 +5,15 @@ export const STORAGE_KEYS = {
   progress: 'genetics_user_progress', editedSections: 'genetics_edited_sections', userMaterials: 'genetics_user_materials',
   flashcards: 'genetics_generated_flashcards', quizzes: 'genetics_generated_quizzes', glossary: 'genetics_user_glossary',
   diseases: 'genetics_user_diseases', editHistory: 'genetics_edit_history', pedigrees: 'genetics_pedigrees',
-  simulator: 'genetics_simulator_history', chats: 'genetics_ai_chat_sessions'
+  simulator: 'genetics_simulator_history', chats: 'genetics_ai_chat_sessions', settings: 'genetics_settings'
 } as const;
 
 const defaultProgress: UserProgress = { readSections: [], flashcardScores: {}, quizScores: {}, quizResults: {} };
 export function clearCorruptedStorageKey(key: string) { localStorage.removeItem(key); }
-export function safeLoad<T>(key: string, fallback: T): T { try { const raw = localStorage.getItem(key); if (!raw) return fallback; return JSON.parse(raw) as T; } catch { clearCorruptedStorageKey(key); return fallback; } }
+export function safeLoad<T>(key: string, fallback: T): T { try { const raw = localStorage.getItem(key); if (!raw) return fallback; const parsed = JSON.parse(raw) as unknown; if (Array.isArray(fallback)) return (Array.isArray(parsed) ? parsed : fallback) as T; if (fallback && typeof fallback === 'object') return (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback) as T; return parsed as T; } catch { clearCorruptedStorageKey(key); return fallback; } }
 export function safeSave<T>(key: string, value: T) { try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { console.error(`Cannot save ${key}`, e); return false; } }
 export function exportAllUserData() { const data: Record<string, unknown> = {}; Object.values(STORAGE_KEYS).forEach(k => data[k] = safeLoad(k, null)); return JSON.stringify({ exportedAt: new Date().toISOString(), data }, null, 2); }
-export function importAllUserData(json: string) { const parsed = JSON.parse(json); const data = parsed.data ?? parsed; Object.values(STORAGE_KEYS).forEach(k => { if (k in data) safeSave(k, data[k]); }); return true; }
+export function importAllUserData(json: string) { try { const parsed = JSON.parse(json); const data = parsed?.data ?? parsed; if (!data || typeof data !== 'object' || Array.isArray(data)) return false; Object.values(STORAGE_KEYS).forEach(k => { if (k in data) safeSave(k, (data as Record<string, unknown>)[k]); }); return true; } catch (e) { console.error('Cannot import user data', e); return false; } }
 export function resetUserData() { Object.values(STORAGE_KEYS).forEach(k => localStorage.removeItem(k)); }
 
 export const getUserEditedSections = (): Record<string, CourseSection> => safeLoad(STORAGE_KEYS.editedSections, {});
@@ -44,6 +44,12 @@ export const savePedigree = (pedigree: Pedigree) => upsertMany(STORAGE_KEYS.pedi
 export const deletePedigree = (id: string) => safeSave(STORAGE_KEYS.pedigrees, getPedigrees().filter(x => x.id !== id));
 export const getSimulatorHistory = (): SimulatorResult[] => safeLoad(STORAGE_KEYS.simulator, []);
 export const saveSimulatorResult = (result: SimulatorResult) => safeSave(STORAGE_KEYS.simulator, [{ ...result, createdAt: Date.now() }, ...getSimulatorHistory()].slice(0, 30));
+
+export type AiSettings = { provider: 'mock' | 'gemini' | 'openai'; apiEndpoint: string; model: string; answerMode: string; retrievalLimit: number; searchSections: boolean; searchGlossary: boolean; searchDiseases: boolean; searchUserMaterials: boolean };
+export const defaultAiSettings: AiSettings = { provider: 'mock', apiEndpoint: '/api/assistant', model: 'gemini-3.5-flash', answerMode: 'подробно', retrievalLimit: 5, searchSections: true, searchGlossary: true, searchDiseases: true, searchUserMaterials: true };
+export const getAiSettings = (): AiSettings => ({ ...defaultAiSettings, ...safeLoad(STORAGE_KEYS.settings, defaultAiSettings) });
+export const saveAiSettings = (settings: AiSettings) => safeSave(STORAGE_KEYS.settings, settings);
+
 export const getAiChatSessions = (): AiChatSession[] => safeLoad(STORAGE_KEYS.chats, []);
 export const saveAiChatSession = (session: AiChatSession) => upsertMany(STORAGE_KEYS.chats, [session]);
 export const deleteAiChatSession = (id: string) => safeSave(STORAGE_KEYS.chats, getAiChatSessions().filter(x => x.id !== id));
