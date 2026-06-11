@@ -1,3 +1,14 @@
+
+export type SubjectId = 'genetics' | 'general';
+export interface Workspace { id: string; title: string; createdAt: string; updatedAt: string; }
+export interface Course { id: string; workspaceId: string; subjectId: SubjectId; title: string; description?: string; icon?: string; color?: string; tags: string[]; createdAt: string; updatedAt: string; }
+export interface SubjectTool { id: string; title: string; route: string; description?: string; }
+export interface SubjectPack { id: SubjectId; title: string; description: string; tools: SubjectTool[]; referenceTypes: string[]; defaultPrompts?: Record<string, string>; }
+export interface LearningSource { id: string; courseId: string; title: string; type: 'pdf' | 'docx' | 'txt' | 'md' | 'manual' | 'paste' | 'url'; fileName?: string; text?: string; pageCount?: number; createdAt: string; updatedAt: string; }
+export interface ReferenceEntry { id: string; courseId: string; sourceIds: string[]; type: string; title: string; fields: Record<string, unknown>; tags: string[]; aiGenerated?: boolean; aiProvider?: string; aiModel?: string; createdAt: string; updatedAt: string; }
+export type GeneticsToolId = 'punnett' | 'pedigree' | 'diseaseReference' | 'inheritanceAnalyzer' | 'karyotypeTrainer' | 'aboRhCalculator';
+export interface GeneticDiseaseEntry extends ReferenceEntry { type: 'geneticDisease'; fields: { inheritanceType?: string; gene?: string; locus?: string; mutation?: string; pathogenesis?: string; symptoms?: string[]; diagnostics?: string; treatment?: string; risk?: string; notes?: string; [key: string]: unknown }; }
+
 export type ManualId = 'genetics-1' | 'genetics-2' | 'genetics-3' | 'user';
 export type Difficulty = 'easy' | 'medium' | 'hard';
 export type Creator = 'system' | 'ai' | 'user';
@@ -17,15 +28,15 @@ export interface KnowledgeLinks {
 export interface SourceManual { id: ManualId; title: string; description: string; authors?: string; year?: number; tags: string[]; chapters: ManualChapter[]; }
 export interface ManualChapter { id: string; manualId: ManualId; title: string; order: number; fragments: ManualFragment[]; }
 export interface ManualFragment extends KnowledgeLinks { id: string; title: string; text: string; order: number; }
-export interface CourseSection extends KnowledgeLinks { id: string; topicId: string; title: string; chapterTitle?: string; content: string; order?: number; keyTerms: string[]; tags: string[]; userEdited?: boolean; updatedAt?: number; }
+export interface CourseSection extends KnowledgeLinks { id: string; topicId: string; title: string; chapterTitle?: string; content: string; order?: number; keyTerms: string[]; tags: string[]; userEdited?: boolean; updatedAt?: number | string; courseId?: string; sourceIds?: string[]; parentId?: string; pageStart?: number; pageEnd?: number; aiGenerated?: boolean; aiProvider?: string; aiModel?: string; createdAt?: number | string; }
 export interface CourseTopic { id: string; sourceId?: ManualId; manualId?: ManualId; title: string; description: string; order?: number; tags?: string[]; sections: CourseSection[]; }
 export type Section = CourseSection;
 export type Topic = CourseTopic;
-export interface GlossaryTerm extends KnowledgeLinks { id: string; term: string; definition: string; expandedExplanation?: string; plainExplanation?: string; example?: string; tags: string[]; difficulty: Difficulty; sourceSectionId?: string; }
+export interface GlossaryTerm extends KnowledgeLinks { id: string; term: string; definition: string; expandedExplanation?: string; plainExplanation?: string; example?: string; examples?: string[]; courseId?: string; sourceIds?: string[]; aiGenerated?: boolean; aiProvider?: string; aiModel?: string; createdAt?: number | string; updatedAt?: number | string; tags: string[]; difficulty: Difficulty; sourceSectionId?: string; }
 export interface DiseaseEntry extends KnowledgeLinks { id: string; name: string; alternativeNames?: string[]; inheritanceType: string; category?: 'chromosomal' | 'monogenic' | 'multifactorial' | 'teratogenic' | 'other'; karyotype?: string; genes?: string; gene?: string; locus?: string; symptoms: string[]; pathogenesis?: string; diagnosis?: string; treatment?: string; prognosis?: string; sourceSectionId?: string; tags: string[]; }
 export type Disease = DiseaseEntry;
-export interface Flashcard extends KnowledgeLinks { id: string; question: string; answer: string; explanation: string; sourceSectionId?: string; topicId?: string; difficulty: Difficulty; tags: string[]; createdBy: Creator; favorite?: boolean; nextReviewAt?: number; interval?: number; repetition?: number; easeFactor?: number; }
-export interface QuizQuestion extends KnowledgeLinks { id: string; text?: string; question?: string; type: 'single' | 'multiple' | 'boolean' | 'open' | 'true_false' | 'matching' | 'genetic_problem'; options?: string[]; correctAnswers?: string[]; correctAnswer?: string | string[]; explanation: string; sourceSectionId?: string; topicId?: string; difficulty: Difficulty; tags: string[]; }
+export interface Flashcard extends KnowledgeLinks { id: string; question: string; answer: string; explanation: string; sourceSectionId?: string; topicId?: string; courseId?: string; sourceIds?: string[]; aiGenerated?: boolean; aiProvider?: string; aiModel?: string; createdAt?: number | string; updatedAt?: number | string; difficulty: Difficulty; tags: string[]; createdBy: Creator; favorite?: boolean; nextReviewAt?: number; interval?: number; repetition?: number; easeFactor?: number; }
+export interface QuizQuestion extends KnowledgeLinks { id: string; text?: string; question?: string; type: 'single' | 'multiple' | 'boolean' | 'open' | 'true_false' | 'matching' | 'genetic_problem' | 'short'; options?: string[]; correctAnswers?: string[]; correctAnswer?: string | string[]; explanation: string; sourceSectionId?: string; topicId?: string; courseId?: string; sourceIds?: string[]; aiGenerated?: boolean; aiProvider?: string; aiModel?: string; createdAt?: number | string; updatedAt?: number | string; difficulty: Difficulty; tags: string[]; }
 export interface GeneticProblem extends KnowledgeLinks { id: string; title: string; kind: string; prompt: string; parent1?: string; parent2?: string; answer: string; explanation: string; tags: string[]; difficulty: Difficulty; }
 export interface UserMaterial { id: string; title: string; rawText: string; processedSections: CourseSection[]; tags: string[]; createdAt: number; updatedAt: number; }
 export interface AiChatMessage { id: string; role: 'user' | 'assistant'; content: string; createdAt: number; sources?: string[]; }

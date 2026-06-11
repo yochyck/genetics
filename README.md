@@ -1,177 +1,124 @@
-# GeneticsEdu
+# UrLocalEdu
 
-React + Vite + TypeScript learning app for general and medical genetics. The app has a Vite frontend and a separate server-side AI broker so provider secrets are never sent to the browser.
+UrLocalEdu is a local-first React + Vite + TypeScript educational platform. The first built-in subject pack is **Genetics**, preserving the GeneticsEdu materials, Punnett simulator, pedigree editor, disease reference, flashcards, quizzes, glossary, import workflow and localStorage recovery.
 
-## 1. Installation
+> Active frontend entrypoint: `index.html` imports `/src/main.tsx`; active app code lives in `src/*`. Older root-level TSX files are legacy duplicates and are not part of the Vite/TypeScript build.
+
+## Install and run
 
 ```bash
 npm install
-```
-
-If your corporate or CI network blocks the npm registry, fix registry/proxy access first and rerun the command. Missing `node_modules` will cause `vite not found`, `tsx not found`, React JSX type errors, and failed builds.
-
-## 2. Frontend
-
-```bash
+npm run server
 npm run dev
 ```
 
-The frontend calls `/api/assistant`, `/api/generate`, and `/api/extract`. In development Vite proxies `/api/*` to the backend at `http://localhost:8787`.
-
-## 3. Backend
-
-Create a backend-only `.env` file:
-
-```bash
-cp .env.example .env
-```
-
-Run the API server:
-
-```bash
-npm run server
-```
-
-Health check:
-
-```bash
-curl http://localhost:8787/api/health
-```
-
-Expected shape:
-
-```json
-{
-  "ok": true,
-  "configuredProvider": "mock",
-  "providerOrder": ["gemini", "groq", "mistral", "mock"],
-  "hasGeminiKey": false,
-  "hasGroqKey": false,
-  "hasMistralKey": false,
-  "geminiModels": ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"],
-  "serverTime": "...",
-  "note": "health checks configuration only; use /api/debug/ai-test for live provider test"
-}
-```
-
-## 4. Run the whole project
+Run both in development:
 
 ```bash
 npm run dev:full
 ```
 
-For debugging, prefer two terminals: one for `npm run server`, one for `npm run dev`.
+## Backend-only AI secrets
 
-## 5. Supported AI providers
+Do **not** create `VITE_GEMINI_API_KEY`, `VITE_GROQ_API_KEY`, `VITE_MISTRAL_API_KEY`, or any frontend secret. Provider keys are read only by the Express backend from `.env`.
 
-OpenAI is no longer used by the provider broker. The supported providers are:
+Create `.env` from `.env.example`:
 
-- `gemini`
-- `groq`
-- `mistral`
-- `mock`
+```bash
+cp .env.example .env
+```
 
-Provider secrets must be stored only in backend `.env`. Do **not** create `VITE_GEMINI_API_KEY`, `VITE_GROQ_API_KEY`, or `VITE_MISTRAL_API_KEY`: Vite exposes `VITE_*` variables to browser code.
-
-## 6. Gemini setup
-
-`.env` only:
+Core AI env contract:
 
 ```bash
 AI_PROVIDER=gemini
-AI_PROVIDER_ORDER=gemini,groq,mistral,mock
-GEMINI_API_KEY=your-server-side-key
+AI_PROVIDER_FALLBACK=groq
+AI_ALLOW_PROVIDER_FALLBACK=true
+AI_ALLOW_MOCK_FALLBACK=true
+AI_DEBUG=true
+AI_TIMEOUT_MS=60000
+AI_MAX_RETRIES=1
+
+GEMINI_API_KEY=
 GEMINI_MODEL_PRIMARY=gemini-3.5-flash
 GEMINI_MODEL_FALLBACK=gemini-3.1-flash-lite
-GEMINI_MODEL_LEGACY_FALLBACK=gemini-flash-latest
-PORT=8787
-```
+GEMINI_MODEL=gemini-3.5-flash
 
-The Gemini provider uses REST `generateContent` with the minimal `contents[].parts[].text` payload and the `x-goog-api-key` header. If a model returns 400/404/429/5xx, the broker tries the next Gemini model and then the next provider in `AI_PROVIDER_ORDER`.
-
-## 7. Groq setup
-
-`.env` only:
-
-```bash
-AI_PROVIDER=groq
-AI_PROVIDER_ORDER=groq,gemini,mistral,mock
-GROQ_API_KEY=your-server-side-key
+GROQ_API_KEY=
 GROQ_MODEL_PRIMARY=llama-3.3-70b-versatile
-GROQ_MODEL_FALLBACK=llama-3.1-8b-instant
-PORT=8787
-```
+GROQ_MODEL_FALLBACK=
 
-Groq is called through its OpenAI-compatible chat completions endpoint directly with `fetch`; no OpenAI SDK or OpenAI provider is used.
-
-## 8. Mistral setup
-
-`.env` only:
-
-```bash
-AI_PROVIDER=mistral
-AI_PROVIDER_ORDER=mistral,gemini,groq,mock
-MISTRAL_API_KEY=your-server-side-key
+MISTRAL_API_KEY=
 MISTRAL_MODEL_PRIMARY=mistral-large-latest
 MISTRAL_MODEL_FALLBACK=mistral-small-latest
-PORT=8787
 ```
 
-Mistral is called through `https://api.mistral.ai/v1/chat/completions` with `fetch`.
+## AI providers
 
-## 9. Fallback behavior
+Supported providers: `gemini`, `groq`, `mistral`, `mock`.
 
-Fallback happens in two layers:
+OpenAI is not used by the provider layer, env contract, docs, or package dependencies. Groq uses its OpenAI-compatible HTTP endpoint directly with `fetch`; no OpenAI SDK is required.
 
-1. Inside a provider: primary model → fallback model(s).
-2. Between providers: according to `AI_PROVIDER_ORDER`.
-3. If all real providers fail or are not configured: `mock`.
+Fallback order:
 
-Every AI response includes `provider`, `model`, `fallbackUsed`, `fallbackReason`, and `fallbackChain`, so 400 BadRequest, missing keys, rate limits, and model failures are visible without exposing keys.
+1. selected/provider primary model;
+2. selected/provider fallback model;
+3. `AI_PROVIDER_FALLBACK` when `AI_ALLOW_PROVIDER_FALLBACK=true`;
+4. explicit mock fallback only when `AI_ALLOW_MOCK_FALLBACK=true`.
 
-## 10. Debug endpoints
+Every AI response includes provider/model/mode/fallbackChain/fallbackReason metadata. Mock fallback is visible and never silently masks provider failure.
 
-Debug endpoints are available outside `NODE_ENV=production`:
+## AI diagnostics
 
 ```bash
-curl http://localhost:8787/api/debug/provider-models
-curl -X POST http://localhost:8787/api/debug/ai-test \
+curl http://localhost:8787/api/health
+curl http://localhost:8787/api/ai/health
+curl http://localhost:8787/api/ai/models
+curl -X POST http://localhost:8787/api/ai/test \
   -H "Content-Type: application/json" \
-  -d '{"provider":"auto","prompt":"Ответь одним словом: работает?"}'
+  -d '{"provider":"mock","prompt":"Ответь одним словом: OK"}'
 ```
 
-Use `/api/debug/ai-test` to verify that a live provider works before testing the UI.
+`/api/ai/test` returns `{ ok, data, meta }`. The legacy `/api/debug/ai-test` remains as an alias for compatibility.
 
-## 11. PDF/DOCX/TXT import
+## Gemini 400 troubleshooting
 
-The Import page supports:
+The Gemini provider uses REST `generateContent` with:
 
-- `.txt` and `.md` via browser file reading;
-- `.pdf` via lazy `pdfjs-dist` import inside the PDF extraction function;
-- `.docx` via lazy `mammoth` import inside the DOCX extraction function;
-- manual paste fallback if extraction fails.
+- `systemInstruction.parts[].text`;
+- `contents[{ role: "user", parts: [{ text }] }]`;
+- `generationConfig.temperature` and `maxOutputTokens`;
+- `responseMimeType: "application/json"` only for JSON tasks, with retry without MIME type if the model rejects it.
 
-AI import buttons call backend `/api/extract` or `/api/generate` and show provider/model/fallback diagnostics. If the backend is unavailable, frontend fallback keeps studying workflows usable offline.
+Common 400 causes:
 
-## 12. Punnett simulator
+- bad model name;
+- model unavailable in the key/project region;
+- model does not support `generateContent` or `responseMimeType`;
+- project/API key restrictions;
+- invalid request body.
 
-The simulator supports classic crosses, AB0/Rh, sex-linked and mitochondrial inheritance, complementary interaction, epistasis, polygenic inheritance, linked genes and recombination frequency. Large squares are hidden by default and summarized with ratios.
+When `AI_DEBUG=true`, server logs safe body previews without API keys.
 
-## 13. Pedigrees
+## Import pipeline
 
-The pedigree editor provides an SVG canvas, add/edit/delete person, relationships, child/parent helpers, auto-layout, zoom/pan, save/load, SVG export, JSON import/export, presets, inheritance heuristics, and optional AI explanation through `/api/assistant`.
+The Import page supports TXT/MD via `File.text()`, PDF via lazy `pdfjs-dist`, DOCX via lazy `mammoth`, local draft splitting, AI split via `/api/split`, AI extraction via `/api/extract`, summary via `/api/summarize`, preview/edit of sections and selected save of terms, diseases, cards, tests and notes.
 
-## 14. User data export/import
+## Storage migration
 
-Use the Editor / Pro settings page to export/import user data JSON and reset local data. Storage access uses safe load/save helpers to avoid crashes on corrupted localStorage JSON.
+Legacy GeneticsEdu localStorage keys (`genetics_*`) are backed up to `urlocaledu:backup:<timestamp>:genetics-legacy-all` and migrated into `urlocaledu:v1:*` keys. Corrupted JSON keys are backed up before removal. Default workspace/course is Genetics.
 
-## 15. Common errors
+## Routes
 
-- `vite not found`: run `npm install` successfully.
-- `tsx not found`: run `npm install`; `tsx` is a dev dependency used by `npm run server`.
-- Gemini `400 BadRequest`: inspect `/api/debug/ai-test`; the broker shows the exact safe error and tries fallback models/providers.
-- `PDF extraction failed`: ensure `pdfjs-dist` installed; otherwise paste text manually.
-- `DOCX extraction failed`: ensure `mammoth` installed; otherwise paste text manually.
-- `/api/health` unavailable: start `npm run server` and verify `PORT=8787`.
-- CORS/proxy issues: check `CORS_ORIGIN` in `.env` and Vite `/api` proxy in `vite.config.ts`.
-- npm registry blocked: fix npm registry/proxy policy; builds cannot be verified without dependencies.
+Legacy routes remain available: `/`, `/materials`, `/sources`, `/flashcards`, `/quizzes`, `/glossary`, `/diseases`, `/simulator`, `/pedigree`, `/assistant`, `/aigen`, `/editor`, `/import`.
+
+New routes: `/courses`, `/settings`, `/ai`.
+
+## Testing
+
+```bash
+npm run typecheck
+npm run build
+```
+
+If no real provider keys are configured, use `provider=mock` for API contract tests. Real Gemini/Groq/Mistral runtime verification requires corresponding backend `.env` keys.

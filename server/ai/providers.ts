@@ -1,125 +1,173 @@
-import { buildAssistantPrompt, buildExtractPrompt, buildGeneratePrompt } from './prompts.ts';
-import { asProviderName, ExtractRequest, GenerateRequest, AssistantRequest } from './schemas.ts';
-import { geminiProvider } from './geminiProvider.ts';
+import { buildAssistantPrompt, buildCoursePlanPrompt, buildExtractPrompt, buildGeneratePrompt, buildSplitPrompt, buildSummaryPrompt } from './prompts.ts';
+import { asProviderName, generationTypeToTask, normalizeFlashcards, normalizeImportExtraction, normalizeQuiz, normalizeSections, normalizeSummary, normalizeTerms, normalizeDiseases, type AssistantRequest, type CoursePlanRequest, type ExtractRequest, type GenerateRequest, type SplitRequest, type SummaryRequest } from './schemas.ts';
+import { geminiProvider, listGeminiModels } from './geminiProvider.ts';
 import { groqProvider } from './groqProvider.ts';
 import { mistralProvider } from './mistralProvider.ts';
-import { mockAssistant, mockExtract, mockGenerate, mockProvider } from './mockProvider.ts';
-import type { AiProvider, AiProviderName, AiTaskType, BrokerResult, FallbackChainEntry } from './providerTypes.ts';
-import { providerNames, safeErrorMessage, uniqueStrings } from './providerTypes.ts';
+import { runMock } from './mockProvider.ts';
+import { extractJsonObject, dedupeByNormalizedKey } from './json.ts';
+import { AiProviderError, toSafeProviderError } from './errors.ts';
+import type { AiCallInput, AiCallMeta, AiCallResult, AiFallbackStep, AiProviderAdapter, AiProviderName } from './types.ts';
 
-const providers: Record<AiProviderName, AiProvider> = { gemini: geminiProvider, groq: groqProvider, mistral: mistralProvider, mock: mockProvider };
-const realProviderNames: AiProviderName[] = ['gemini', 'groq', 'mistral'];
+const adapters: Record<AiProviderName, AiProviderAdapter | undefined> = { gemini: geminiProvider, groq: groqProvider, mistral: mistralProvider, mock: undefined };
+const realProviders: AiProviderName[] = ['gemini', 'groq', 'mistral'];
+const bool = (value: unknown, fallback: boolean) => value == null || value === '' ? fallback : ['1','true','yes','on'].includes(String(value).toLowerCase());
+const configuredProvider = () => asProviderName(String(process.env.AI_PROVIDER || 'mock').toLowerCase()) || 'mock';
+const fallbackProvider = () => asProviderName(String(process.env.AI_PROVIDER_FALLBACK || 'groq').toLowerCase());
+const allowProviderFallback = () => bool(process.env.AI_ALLOW_PROVIDER_FALLBACK, true);
+const allowMockFallback = () => bool(process.env.AI_ALLOW_MOCK_FALLBACK, true);
+const retryable = (status?: number) => !status || [400,404,408,409,429,500,502,503,504].includes(status);
 
-export function getConfiguredProvider(): AiProviderName {
-  return asProviderName((process.env.AI_PROVIDER || 'mock').toLowerCase()) || 'mock';
+function emptyMeta(start: number, chain: AiFallbackStep[] = []): AiCallMeta {
+  return { provider: 'mock', model: 'none', mode: 'mock', usedFallback: false, fallbackChain: chain, durationMs: Date.now() - start };
 }
 
-export function getProvider(): AiProviderName {
-  const configured = getConfiguredProvider();
-  return providers[configured].isConfigured() ? configured : 'mock';
+function mockResult(input: AiCallInput, start: number, chain: AiFallbackStep[], fallbackReason?: string): AiCallResult {
+  const output = runMock(input);
+  const json = input.responseMode === 'json' ? extractJsonObject(output.text) : undefined;
+  const step = { provider: 'mock' as const, model: 'local-safe-fallback', ok: true };
+  const fullChain = [...chain, step];
+  return { ok: true, text: output.text, json: json ?? undefined, meta: { provider: 'mock', model: 'local-safe-fallback', mode: 'mock', usedFallback: Boolean(fallbackReason), fallbackReason, fallbackChain: fullChain, durationMs: Date.now() - start } };
 }
 
-export function getProviderOrder(preferredProvider?: string): AiProviderName[] {
-  const configured = getConfiguredProvider();
-  const envOrder = (process.env.AI_PROVIDER_ORDER || 'gemini,groq,mistral,mock').split(',').map((x) => asProviderName(x.trim())).filter(Boolean) as AiProviderName[];
-  const preferred = asProviderName(preferredProvider) || undefined;
-  if (preferred === 'mock') return ['mock'];
-  return uniqueStrings([preferred, configured !== 'mock' ? configured : undefined, ...envOrder, 'mock']).map((x) => x as AiProviderName).filter((name) => providerNames.includes(name));
+async function callProvider(input: AiCallInput, provider: AiProviderName, providerFallbackMode: boolean, start: number, chain: AiFallbackStep[]): Promise<AiCallResult | null> {
+  const adapter = adapters[provider];
+  if (!adapter) return mockResult(input, start, chain, input.preferredProvider === 'mock' || configuredProvider() === 'mock' ? undefined : 'provider_is_mock');
+  const models = adapter.getModels(input.preferredModel);
+  if (!adapter.isConfigured()) {
+    chain.push({ provider, model: models.primary, ok: false, status: 401, error: `${provider}_not_configured` });
+    return null;
+  }
+  for (const [index, model] of models.candidates.entries()) {
+    try {
+      const output = await adapter.call({ ...input, provider, model });
+      const step = { provider, model, ok: true };
+      const fullChain = [...chain, step];
+      const mode: AiCallMeta['mode'] = providerFallbackMode ? 'provider-fallback' : index > 0 ? 'fallback' : 'primary';
+      return { ok: true, text: output.text, json: input.responseMode === 'json' ? extractJsonObject(output.text) ?? undefined : undefined, meta: { provider, model, mode, usedFallback: fullChain.length > 1 || mode !== 'primary', fallbackReason: fullChain.length > 1 || mode !== 'primary' ? chain.map((x) => `${x.provider}/${x.model || 'none'}: ${x.error || x.status || 'failed'}`).join(' | ') : undefined, fallbackChain: fullChain, durationMs: Date.now() - start } };
+    } catch (error) {
+      const safe = toSafeProviderError(error);
+      chain.push({ provider, model, ok: false, status: safe.status, error: safe.message, providerBodyPreview: safe.providerBodyPreview });
+      if (error instanceof AiProviderError && !retryable(error.status)) break;
+    }
+  }
+  return null;
 }
 
-export function providerDiagnostics() {
+export async function runAi(input: AiCallInput): Promise<AiCallResult> {
+  const start = Date.now();
+  const chain: AiFallbackStep[] = [];
+  const requested = input.preferredProvider && input.preferredProvider !== 'auto' ? input.preferredProvider : configuredProvider();
+  if (requested === 'mock') return mockResult(input, start, chain);
+  const primary = asProviderName(requested) || 'mock';
+  if (!realProviders.includes(primary)) {
+    return allowMockFallback() ? mockResult(input, start, chain, `unknown_provider:${requested}`) : { ok: false, meta: emptyMeta(start, chain), error: { message: `unknown_provider:${requested}` } };
+  }
+  const primaryResult = await callProvider(input, primary, false, start, chain);
+  if (primaryResult) return primaryResult;
+  const backup = fallbackProvider();
+  if (allowProviderFallback() && backup && backup !== primary && realProviders.includes(backup)) {
+    const backupResult = await callProvider({ ...input, preferredModel: undefined }, backup, true, start, chain);
+    if (backupResult) return backupResult;
+  }
+  const reason = chain.map((x) => `${x.provider}/${x.model || 'none'}: ${x.error || x.status || 'failed'}`).join(' | ') || 'all_real_providers_failed';
+  if (allowMockFallback()) return mockResult(input, start, chain, reason);
+  const last = chain.at(-1);
+  return { ok: false, meta: { ...emptyMeta(start, chain), usedFallback: chain.length > 1, fallbackReason: reason }, error: { status: last?.status, message: reason, providerBodyPreview: last?.providerBodyPreview } };
+}
+
+export function getAiHealth() {
   return {
-    configuredProvider: getConfiguredProvider(),
-    providerOrder: getProviderOrder(),
+    provider: configuredProvider(),
+    configuredProvider: configuredProvider(),
     hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
     hasGroqKey: Boolean(process.env.GROQ_API_KEY),
     hasMistralKey: Boolean(process.env.MISTRAL_API_KEY),
-    geminiModels: geminiProvider.getModelCandidates(),
-    groqModels: groqProvider.getModelCandidates(),
-    mistralModels: mistralProvider.getModelCandidates(),
+    providerFallbackEnabled: allowProviderFallback(),
+    mockFallbackEnabled: allowMockFallback(),
+    fallbackProvider: fallbackProvider() || null,
+    models: getProviderModels(false),
   };
 }
 
-export function providerModels() {
-  return {
-    gemini: { configured: geminiProvider.isConfigured(), models: geminiProvider.getModelCandidates() },
-    groq: { configured: groqProvider.isConfigured(), models: groqProvider.getModelCandidates() },
-    mistral: { configured: mistralProvider.isConfigured(), models: mistralProvider.getModelCandidates() },
+export function getProviderModels(includeLive = false) {
+  const configured = {
+    gemini: { configured: geminiProvider.isConfigured(), ...geminiProvider.getModels() },
+    groq: { configured: groqProvider.isConfigured(), ...groqProvider.getModels() },
+    mistral: { configured: mistralProvider.isConfigured(), ...mistralProvider.getModels() },
+    mock: { configured: true, primary: 'local-safe-fallback', candidates: ['local-safe-fallback'] },
   };
+  return includeLive ? configured : configured;
 }
 
-async function brokerCall(prompt: string, task: AiTaskType, kind: 'text' | 'json', preferredProvider?: string, preferredModel?: string): Promise<BrokerResult> {
-  const fallbackChain: FallbackChainEntry[] = [];
-  for (const providerName of getProviderOrder(preferredProvider)) {
-    const provider = providers[providerName];
-    const candidates = provider.getModelCandidates(task, preferredModel);
-    if (providerName !== 'mock' && !provider.isConfigured()) {
-      fallbackChain.push({ provider: providerName, modelsTried: candidates, ok: false, error: `${providerName}_not_configured` });
-      continue;
-    }
-    try {
-      const result = kind === 'json'
-        ? await provider.callJson(prompt, { task, preferredModel, forceJson: true })
-        : await provider.callText(prompt, { task, preferredModel });
-      fallbackChain.push({ provider: providerName, modelsTried: result.triedModels || candidates, ok: result.ok, model: result.ok ? result.model : undefined, error: result.ok ? undefined : result.providerError, rawStatus: result.rawStatus });
-      if (result.ok) return { ...result, fallbackUsed: fallbackChain.length > 1 || providerName === 'mock', fallbackReason: fallbackChain.length > 1 ? fallbackChain.slice(0, -1).map((x) => `${x.provider}: ${x.error || 'failed'}`).join(' | ') : undefined, fallbackChain };
-    } catch (error) {
-      fallbackChain.push({ provider: providerName, modelsTried: candidates, ok: false, error: safeErrorMessage(error) });
-    }
-  }
-  const mock = await mockProvider.callText(prompt, { task });
-  fallbackChain.push({ provider: 'mock', modelsTried: ['local-retrieval-mock'], ok: true, model: 'local-retrieval-mock' });
-  return { ...mock, fallbackUsed: true, fallbackReason: 'all_real_providers_failed', fallbackChain };
+export async function getProviderModelsWithLive() {
+  return { ...getProviderModels(false), geminiLive: await listGeminiModels() };
 }
 
-const asRecord = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-const asArray = (value: unknown) => Array.isArray(value) ? value : [];
-
-function normalizeItems(json: unknown, fallbackItems: unknown[]) {
-  const row = asRecord(json);
-  return Array.isArray(row.items) ? row.items : Array.isArray(json) ? json as unknown[] : fallbackItems;
+export async function testAiProvider(provider?: AiProviderName | 'auto', prompt = 'Ответь одним словом: OK', preferredModel?: string) {
+  return runAi({ task: 'assistant', systemPrompt: 'Ты тестовый ассистент. Ответь кратко.', userPrompt: prompt, responseMode: 'text', preferredProvider: provider || 'auto', preferredModel, maxTokens: 64, temperature: 0 });
 }
 
-function normalizeExtract(json: unknown, fallback: Awaited<ReturnType<typeof mockExtract>>) {
-  const row = asRecord(json);
-  return {
-    sections: asArray(row.sections).length ? asArray(row.sections) : fallback.sections,
-    tags: asArray(row.tags).length ? asArray(row.tags) : fallback.tags,
-    terms: asArray(row.terms).length ? asArray(row.terms) : fallback.terms,
-    diseases: asArray(row.diseases).length ? asArray(row.diseases) : fallback.diseases,
-    flashcards: asArray(row.flashcards).length ? asArray(row.flashcards) : fallback.flashcards,
-    quiz: asArray(row.quiz).length ? asArray(row.quiz) : fallback.quiz,
-    problems: asArray(row.problems).length ? asArray(row.problems) : fallback.problems,
-    summary: typeof row.summary === 'string' && row.summary ? row.summary : fallback.summary,
-  };
-}
+const metaFields = (result: AiCallResult) => ({ provider: result.meta.provider, model: result.meta.model, mode: result.meta.mode, usedFallback: result.meta.usedFallback, fallbackUsed: result.meta.usedFallback, fallbackReason: result.meta.fallbackReason, fallbackChain: result.meta.fallbackChain });
 
 export async function runAssistant(payload: AssistantRequest) {
-  const result = await brokerCall(buildAssistantPrompt(payload), 'assistant', 'text', payload.preferredProvider, payload.preferredModel);
-  if (result.provider === 'mock') {
-    const mock = await mockAssistant(payload);
-    return { ...mock, fallbackUsed: result.fallbackUsed ?? true, fallbackReason: result.fallbackReason, fallbackChain: result.fallbackChain };
-  }
-  return { answer: result.text || '', usedSources: payload.context?.sources || [], provider: result.provider, model: result.model, fallbackUsed: Boolean(result.fallbackUsed), fallbackReason: result.fallbackReason, fallbackChain: result.fallbackChain };
+  const prompt = buildAssistantPrompt(payload);
+  const result = await runAi({ task: 'assistant', ...prompt, responseMode: 'text', preferredProvider: payload.preferredProvider, preferredModel: payload.preferredModel });
+  const data = { answer: result.text || result.error?.message || '', usedSources: payload.context.sources || [] };
+  return { ok: result.ok, data, meta: result.meta, ...data, ...metaFields(result), error: result.error };
+}
+
+function normalizeGenerated(type: GenerateRequest['type'], raw: unknown) {
+  if (type === 'flashcards') return normalizeFlashcards(raw);
+  if (type === 'quiz') return normalizeQuiz(raw);
+  if (type === 'terms') return normalizeTerms(raw);
+  if (type === 'diseases') return normalizeDiseases(raw);
+  if (type === 'summary' || type === 'study_plan') return [normalizeSummary(raw)];
+  return raw;
 }
 
 export async function runGenerate(payload: GenerateRequest) {
-  const result = await brokerCall(buildGeneratePrompt(payload), 'generate', 'json', payload.preferredProvider, payload.preferredModel);
-  const fallback = await mockGenerate(payload);
-  const items = result.ok && result.provider !== 'mock' ? normalizeItems(result.json, fallback.items) : fallback.items;
-  return { items, provider: result.provider, model: result.model, fallbackUsed: Boolean(result.fallbackUsed), fallbackReason: result.fallbackReason, fallbackChain: result.fallbackChain };
+  const prompt = buildGeneratePrompt(payload);
+  const result = await runAi({ task: generationTypeToTask(payload.type), ...prompt, preferredProvider: payload.preferredProvider, preferredModel: payload.preferredModel });
+  const raw = result.json ?? (result.text ? extractJsonObject(result.text) : null);
+  const items = normalizeGenerated(payload.type, raw) as unknown[];
+  const data = { items, text: result.text };
+  return { ok: result.ok, data, meta: result.meta, items, ...metaFields(result), error: result.error };
 }
 
 export async function runExtract(payload: ExtractRequest) {
-  const result = await brokerCall(buildExtractPrompt(payload), 'extract', 'json', payload.options.preferredProvider, payload.options.preferredModel);
-  const fallback = await mockExtract(payload.text, payload.tasks);
-  const extracted = result.ok && result.provider !== 'mock' ? normalizeExtract(result.json, fallback) : fallback;
-  return { ...extracted, provider: result.provider, model: result.model, fallbackUsed: Boolean(result.fallbackUsed), fallbackReason: result.fallbackReason, fallbackChain: result.fallbackChain };
+  const prompt = buildExtractPrompt(payload);
+  const result = await runAi({ task: 'extract', ...prompt, responseMode: 'json', preferredProvider: payload.options.preferredProvider, preferredModel: payload.options.preferredModel });
+  const normalized = normalizeImportExtraction(result.json ?? (result.text ? extractJsonObject(result.text) : null));
+  normalized.terms = dedupeByNormalizedKey(normalized.terms, (x) => x.term);
+  normalized.diseases = dedupeByNormalizedKey(normalized.diseases, (x) => x.name);
+  normalized.flashcards = dedupeByNormalizedKey(normalized.flashcards, (x) => x.question);
+  normalized.quiz = dedupeByNormalizedKey(normalized.quiz, (x) => x.question);
+  return { ok: result.ok, data: normalized, meta: result.meta, ...normalized, summary: normalized.summary.content, summaryObject: normalized.summary, ...metaFields(result), error: result.error };
 }
 
-export async function runDebugAiTest(provider: string, prompt: string, preferredModel?: string) {
-  const result = await brokerCall(prompt, 'assistant', 'text', provider === 'auto' ? undefined : provider, preferredModel);
-  return { ok: result.ok, provider: result.provider, model: result.model, answer: result.text || '', fallbackUsed: Boolean(result.fallbackUsed), fallbackReason: result.fallbackReason, fallbackChain: result.fallbackChain, error: result.ok ? undefined : result.providerError };
+export async function runSplit(payload: SplitRequest) {
+  const prompt = buildSplitPrompt(payload);
+  const result = await runAi({ task: 'split', ...prompt, responseMode: 'json', preferredProvider: payload.preferredProvider, preferredModel: payload.preferredModel });
+  const sections = normalizeSections(result.json ?? (result.text ? extractJsonObject(result.text) : null));
+  return { ok: result.ok, data: { sections }, meta: result.meta, sections, ...metaFields(result), error: result.error };
 }
 
-export { realProviderNames };
+export async function runSummary(payload: SummaryRequest) {
+  const prompt = buildSummaryPrompt(payload);
+  const result = await runAi({ task: 'summary', ...prompt, responseMode: 'json', preferredProvider: payload.preferredProvider, preferredModel: payload.preferredModel });
+  const summary = normalizeSummary(result.json ?? (result.text ? extractJsonObject(result.text) : result.text));
+  return { ok: result.ok, data: { summary }, meta: result.meta, summary: summary.content, summaryObject: summary, ...metaFields(result), error: result.error };
+}
+
+export async function runCoursePlan(payload: CoursePlanRequest) {
+  const prompt = buildCoursePlanPrompt(payload);
+  const result = await runAi({ task: 'course_add', ...prompt, responseMode: 'json', preferredProvider: payload.preferredProvider, preferredModel: payload.preferredModel });
+  const raw = result.json ?? (result.text ? extractJsonObject(result.text) : null);
+  const data = { sections: normalizeSections(raw), summary: normalizeSummary((raw as Record<string, unknown> | null)?.summary) };
+  return { ok: result.ok, data, meta: result.meta, ...data, ...metaFields(result), error: result.error };
+}
+
+export const getConfiguredProvider = configuredProvider;
+export const providerDiagnostics = getAiHealth;
+export const providerModels = getProviderModels;
+export const runDebugAiTest = testAiProvider;

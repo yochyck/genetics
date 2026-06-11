@@ -1,74 +1,91 @@
-import { extractJsonObject } from './schemas.ts';
-import type { AiCallOptions, AiProvider, AiProviderResult } from './providerTypes.ts';
-import { safeErrorMessage, uniqueStrings } from './providerTypes.ts';
+import { AiProviderError, debugProviderError, previewBody } from './errors.ts';
+import type { AiProviderAdapter, ProviderCallInput, ProviderCallOutput } from './types.ts';
 
-const GEMINI_DEFAULTS = ['gemini-3.5-flash','gemini-3.1-flash-lite','gemini-flash-latest','gemini-2.5-flash','gemini-2.5-flash-lite'];
-const geminiUrl = (model: string) => `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+const DEFAULT_PRIMARY = 'gemini-3.5-flash';
+const DEFAULT_FALLBACK = 'gemini-3.1-flash-lite';
+const clean = (value?: string) => String(value || '').trim();
+const normalizeModel = (model: string) => clean(model).replace(/^models\//, '');
+const unique = (items: Array<string | undefined>) => Array.from(new Set(items.map(clean).filter(Boolean)));
 
-type GeminiError = { status?: number; code?: string; message?: string };
-
-function parseError(status: number, body: string): string {
-  let parsed: GeminiError = { status };
+function parseGeminiError(status: number, bodyText: string) {
   try {
-    const json = JSON.parse(body) as { error?: { status?: string; message?: string; code?: number } };
-    parsed = { status, code: json.error?.status || String(json.error?.code || status), message: json.error?.message || body.slice(0, 500) };
+    const json = JSON.parse(bodyText) as { error?: { status?: string; message?: string; code?: number } };
+    return { code: json.error?.status || String(json.error?.code || status), message: json.error?.message || `Gemini HTTP ${status}` };
   } catch {
-    parsed = { status, message: body.slice(0, 500) };
+    return { code: String(status), message: bodyText.slice(0, 500) || `Gemini HTTP ${status}` };
   }
-  return `gemini_http_${status}${parsed.code ? `:${parsed.code}` : ''}${parsed.message ? `:${parsed.message}` : ''}`;
 }
 
-async function requestGemini(model: string, prompt: string, options: AiCallOptions, responseMimeType?: 'application/json') {
+async function requestGemini(input: ProviderCallInput, useMimeType: boolean): Promise<ProviderCallOutput> {
   const key = process.env.GEMINI_API_KEY;
-  if (!key) return { ok: false as const, error: 'gemini_missing_key', status: 401 };
-  const generationConfig: Record<string, unknown> = { temperature: options.temperature ?? (options.forceJson ? 0.15 : 0.25), topP: 0.9, maxOutputTokens: options.maxTokens ?? 4096 };
-  if (responseMimeType) generationConfig.responseMimeType = responseMimeType;
-  const response = await fetch(geminiUrl(model), {
+  if (!key) throw new AiProviderError('Gemini API key is not configured', { provider: 'gemini', model: input.model, status: 401, code: 'gemini_missing_key' });
+  const modelName = normalizeModel(input.model);
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
+  const userPrompt = input.responseMode === 'json' && !useMimeType ? `${input.userPrompt}\n\nВерни только валидный JSON без markdown и комментариев.` : input.userPrompt;
+  const generationConfig: Record<string, unknown> = {
+    temperature: input.temperature ?? (input.responseMode === 'json' ? 0.15 : 0.2),
+    maxOutputTokens: input.maxTokens ?? 4096,
+  };
+  if (input.responseMode === 'json' && useMimeType) generationConfig.responseMimeType = 'application/json';
+  const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig }),
+    headers: { 'Content-Type': 'application/json', 'X-goog-api-key': key },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: input.systemPrompt }] },
+      contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+      generationConfig,
+    }),
   });
-  const body = await response.text();
-  if (!response.ok) return { ok: false as const, error: parseError(response.status, body), status: response.status };
-  let data: Record<string, unknown> = {};
-  try { data = JSON.parse(body) as Record<string, unknown>; } catch { return { ok: false as const, error: 'gemini_invalid_json_response', status: response.status }; }
+  const bodyText = await response.text();
+  if (!response.ok) {
+    const parsed = parseGeminiError(response.status, bodyText);
+    const error = new AiProviderError('Gemini request failed', { provider: 'gemini', model: modelName, status: response.status, code: parsed.code, bodyText, safeMessage: parsed.message });
+    debugProviderError(error);
+    throw error;
+  }
+  let data: Record<string, unknown>;
+  try { data = JSON.parse(bodyText) as Record<string, unknown>; } catch {
+    throw new AiProviderError('Gemini returned invalid JSON envelope', { provider: 'gemini', model: modelName, status: response.status, bodyText });
+  }
   const promptFeedback = data.promptFeedback as { blockReason?: string } | undefined;
-  if (promptFeedback?.blockReason) return { ok: false as const, error: `gemini_prompt_blocked:${promptFeedback.blockReason}`, status: response.status };
-  const candidates = Array.isArray(data.candidates) ? data.candidates as Array<{ finishReason?: string; content?: { parts?: Array<{ text?: string }> }; safetyRatings?: unknown[] }> : [];
+  const candidates = Array.isArray(data.candidates) ? data.candidates as Array<{ finishReason?: string; content?: { parts?: Array<{ text?: string }> } }> : [];
   const first = candidates[0];
   const text = first?.content?.parts?.map((part) => part.text || '').filter(Boolean).join('\n').trim() || '';
-  if (!text) return { ok: false as const, error: first?.finishReason ? `gemini_empty_response:${first.finishReason}` : 'gemini_empty_response', status: response.status };
-  return { ok: true as const, text, status: response.status };
-}
-
-async function call(prompt: string, options: AiCallOptions): Promise<AiProviderResult> {
-  const triedModels: string[] = [];
-  let lastError = 'gemini_no_model_succeeded';
-  let lastStatus: number | undefined;
-  for (const model of geminiProvider.getModelCandidates(options.task, options.preferredModel)) {
-    triedModels.push(model);
-    try {
-      const first = options.forceJson ? await requestGemini(model, prompt, options, 'application/json') : await requestGemini(model, prompt, options);
-      const result = first.ok ? first : options.forceJson && first.status === 400 ? await requestGemini(model, prompt, { ...options, forceJson: false }) : first;
-      if (result.ok) return { ok: true, provider: 'gemini', model, text: result.text, triedModels };
-      lastError = result.error;
-      lastStatus = result.status;
-    } catch (error) {
-      lastError = safeErrorMessage(error, 'gemini_fetch_failed');
-    }
+  if (!text) {
+    const reason = promptFeedback?.blockReason ? `gemini_prompt_blocked:${promptFeedback.blockReason}` : first?.finishReason ? `gemini_empty_response:${first.finishReason}` : 'gemini_empty_response';
+    throw new AiProviderError(reason, { provider: 'gemini', model: modelName, status: response.status, bodyText: previewBody(bodyText) });
   }
-  return { ok: false, provider: 'gemini', model: triedModels.at(-1) || 'unknown', providerError: lastError, triedModels, rawStatus: lastStatus };
+  return { text };
 }
 
-export const geminiProvider: AiProvider = {
+export const geminiProvider: AiProviderAdapter = {
   name: 'gemini',
   isConfigured: () => Boolean(process.env.GEMINI_API_KEY),
-  getModelCandidates: (_task, preferredModel) => uniqueStrings([preferredModel, process.env.GEMINI_MODEL_PRIMARY, process.env.GEMINI_MODEL, process.env.GEMINI_MODEL_FALLBACK, process.env.GEMINI_MODEL_LEGACY_FALLBACK, ...GEMINI_DEFAULTS]),
-  callText: (prompt, options) => call(prompt, { ...options, forceJson: false }),
-  async callJson(prompt, options) {
-    const result = await call(prompt, { ...options, forceJson: true });
-    if (!result.ok) return result;
-    const json = extractJsonObject(result.text || '');
-    return json ? { ...result, json } : { ...result, ok: false, providerError: 'gemini_json_parse_failed' };
+  getModels(preferredModel?: string) {
+    const primary = clean(preferredModel) || clean(process.env.GEMINI_MODEL_PRIMARY) || clean(process.env.GEMINI_MODEL) || DEFAULT_PRIMARY;
+    const fallback = clean(process.env.GEMINI_MODEL_FALLBACK) || DEFAULT_FALLBACK;
+    return { primary, fallback, candidates: unique([primary, fallback]) };
+  },
+  async call(input) {
+    try {
+      return await requestGemini(input, input.responseMode === 'json');
+    } catch (error) {
+      if (input.responseMode === 'json' && error instanceof AiProviderError && error.status === 400) return requestGemini(input, false);
+      throw error;
+    }
   },
 };
+
+export async function listGeminiModels() {
+  const key = process.env.GEMINI_API_KEY;
+  if (!key) return { ok: false as const, error: 'gemini_missing_key', models: [] };
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/models', { headers: { 'X-goog-api-key': key } });
+  const bodyText = await response.text();
+  if (!response.ok) return { ok: false as const, error: previewBody(bodyText, 800), models: [] };
+  try {
+    const data = JSON.parse(bodyText) as { models?: Array<{ name: string; displayName?: string; supportedGenerationMethods?: string[] }> };
+    return { ok: true as const, models: (data.models || []).filter((m) => m.supportedGenerationMethods?.includes('generateContent')).map((m) => ({ name: m.name, displayName: m.displayName, supportedGenerationMethods: m.supportedGenerationMethods })) };
+  } catch {
+    return { ok: false as const, error: 'gemini_models_invalid_json', models: [] };
+  }
+}

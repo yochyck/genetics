@@ -1,6 +1,7 @@
 import { Flashcard, GlossaryTerm, QuizQuestion, DiseaseEntry, CourseSection, GeneticProblem } from '../types';
 import { courseSections, diseases } from '../data';
 import { getAiSettings } from '../store';
+import { callGenerate, callExtract } from './client';
 const id = (p:string) => `${p}-${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
 const sentences = (text:string) => text.split(/[.!?]\s+/).map(s=>s.trim()).filter(s=>s.length>35);
 export type GenerationKind = 'flashcards'|'quizzes'|'open_questions'|'problems'|'terms'|'diseases'|'summary'|'plan'|'selfcheck'|'solution';
@@ -21,21 +22,14 @@ export function generateFromText(kind: GenerationKind, text: string, section?: C
 export function generateFromSection(kind: GenerationKind, sectionId: string) { const section = courseSections.find(s=>s.id===sectionId) || courseSections[0]; return generateFromText(kind, section.content, section); }
 
 const kindToApiType = (kind: GenerationKind): AiGenerationType => kind === 'quizzes' || kind === 'selfcheck' ? 'quiz' : kind === 'problems' || kind === 'solution' ? 'genetic_problem' : kind === 'plan' ? 'study_plan' : kind === 'flashcards' || kind === 'terms' || kind === 'diseases' || kind === 'summary' ? kind : 'summary';
-const endpoint = () => (import.meta.env.VITE_GENERATE_ENDPOINT as string | undefined) || '/api/generate';
 const ensureArray = (value: unknown): unknown[] => Array.isArray(value) ? value : [];
 
 export async function generateFromAI(kind: GenerationKind, text: string, section?: CourseSection, count = 8): Promise<GenerationResponse> {
   const settings = getAiSettings();
-  try {
-    const response = await fetch(endpoint(), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: kindToApiType(kind), text, count, difficulty: 'medium', sourceMeta: section ? { sectionId: section.id, manualId: section.manualId, title: section.title, preferredProvider: settings.provider, preferredModel: settings.model } : { preferredProvider: settings.provider, preferredModel: settings.model }, preferredProvider: settings.provider, preferredModel: settings.model }) });
-    if (!response.ok) throw new Error(`API ${response.status}`);
-    const data = await response.json();
-    const items = ensureArray(data.items);
-    const provider: GenerationProvider = data.provider === 'gemini' || data.provider === 'groq' || data.provider === 'mistral' ? data.provider : 'mock';
-    return { items, provider, model: String(data.model || ''), apiAvailable: true, fallbackUsed: Boolean(data.fallbackUsed), fallbackReason: typeof data.fallbackReason === 'string' ? data.fallbackReason : undefined, fallbackChain: Array.isArray(data.fallbackChain) ? data.fallbackChain : [] };
-  } catch (error) {
-    return { items: generateFromText(kind, text, section) as unknown[], provider: 'mock', model: 'local-browser-mock', apiAvailable: false, error: error instanceof Error ? error.message : 'API unavailable', fallbackUsed: true, fallbackReason: 'frontend_backend_unavailable', fallbackChain: [{ provider: 'mock', modelsTried: ['local-browser-mock'], ok: true, model: 'local-browser-mock' }] };
-  }
+  const response = await callGenerate({ type: kindToApiType(kind), text, count, difficulty: 'medium', sourceMeta: section ? { sectionId: section.id, manualId: section.manualId, title: section.title, preferredProvider: settings.preferredGeneratorProvider || settings.provider, preferredModel: settings.model } : { preferredProvider: settings.preferredGeneratorProvider || settings.provider, preferredModel: settings.model }, preferredProvider: settings.preferredGeneratorProvider || settings.provider, preferredModel: settings.model });
+  const items = ensureArray(response.data.items);
+  if (response.ok || items.length) return { items, provider: response.meta.provider, model: response.meta.model, apiAvailable: response.ok, error: response.error, fallbackUsed: response.meta.usedFallback, fallbackReason: response.meta.fallbackReason, fallbackChain: response.meta.fallbackChain };
+  return { items: generateFromText(kind, text, section) as unknown[], provider: 'mock', model: 'local-browser-mock', apiAvailable: false, error: response.error, fallbackUsed: true, fallbackReason: response.meta.fallbackReason || 'frontend_backend_unavailable', fallbackChain: response.meta.fallbackChain };
 }
 
 export type ExtractionResponse = {
@@ -47,6 +41,7 @@ export type ExtractionResponse = {
   quiz: unknown[];
   problems: unknown[];
   summary: string;
+  summaryObject?: unknown;
   provider: GenerationProvider;
   model?: string;
   apiAvailable: boolean;
@@ -56,17 +51,11 @@ export type ExtractionResponse = {
   error?: string;
 };
 
-const extractEndpoint = () => (import.meta.env.VITE_EXTRACT_ENDPOINT as string | undefined) || '/api/extract';
-
 export async function extractWithAI(text: string, tasks: string[], sourceMeta: Record<string, unknown> = {}): Promise<ExtractionResponse> {
   const settings = getAiSettings();
-  try {
-    const response = await fetch(extractEndpoint(), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text, tasks, sourceMeta, options: { sectionCount: 8, cardCount: 20, quizCount: 20, difficulty: 'medium', language: 'ru', preferredProvider: settings.preferredImportProvider || settings.provider, preferredModel: settings.model } }) });
-    if (!response.ok) throw new Error(`API ${response.status}`);
-    const data = await response.json();
-    const provider: GenerationProvider = data.provider === 'gemini' || data.provider === 'groq' || data.provider === 'mistral' ? data.provider : 'mock';
-    return { sections: ensureArray(data.sections), tags: ensureArray(data.tags), terms: ensureArray(data.terms), diseases: ensureArray(data.diseases), flashcards: ensureArray(data.flashcards), quiz: ensureArray(data.quiz), problems: ensureArray(data.problems), summary: String(data.summary || ''), provider, model: String(data.model || ''), apiAvailable: true, fallbackUsed: Boolean(data.fallbackUsed), fallbackReason: typeof data.fallbackReason === 'string' ? data.fallbackReason : undefined, fallbackChain: Array.isArray(data.fallbackChain) ? data.fallbackChain : [] };
-  } catch (error) {
-    return { sections: [], tags: extractTerms(text), terms: generateFromText('terms', text) as unknown[], diseases: [], flashcards: generateFromText('flashcards', text) as unknown[], quiz: generateFromText('quizzes', text) as unknown[], problems: [], summary: sentences(text).slice(0, 5).join('. '), provider: 'mock', model: 'local-browser-mock', apiAvailable: false, fallbackUsed: true, fallbackReason: 'frontend_backend_unavailable', fallbackChain: [{ provider: 'mock', modelsTried: ['local-browser-mock'], ok: true, model: 'local-browser-mock' }], error: error instanceof Error ? error.message : 'API unavailable' };
-  }
+  const response = await callExtract({ text, tasks, sourceMeta, options: { sectionCount: 8, cardCount: 20, quizCount: 20, difficulty: 'medium', language: 'ru', preferredProvider: settings.preferredImportProvider || settings.provider, preferredModel: settings.model } });
+  const row = response.data;
+  const summaryValue = typeof row.summary === 'string' ? row.summary : typeof row.summaryObject === 'object' && row.summaryObject && 'content' in row.summaryObject ? String((row.summaryObject as { content?: unknown }).content || '') : '';
+  if (response.ok || Object.keys(row).length) return { sections: ensureArray(row.sections), tags: ensureArray(row.tags), terms: ensureArray(row.terms), diseases: ensureArray(row.diseases), flashcards: ensureArray(row.flashcards), quiz: ensureArray(row.quiz), problems: ensureArray(row.problems), summary: summaryValue, summaryObject: row.summaryObject, provider: response.meta.provider, model: response.meta.model, apiAvailable: response.ok, fallbackUsed: response.meta.usedFallback, fallbackReason: response.meta.fallbackReason, fallbackChain: response.meta.fallbackChain, error: response.error };
+  return { sections: [], tags: extractTerms(text), terms: generateFromText('terms', text) as unknown[], diseases: [], flashcards: generateFromText('flashcards', text) as unknown[], quiz: generateFromText('quizzes', text) as unknown[], problems: [], summary: sentences(text).slice(0, 5).join('. '), provider: 'mock', model: 'local-browser-mock', apiAvailable: false, fallbackUsed: true, fallbackReason: response.meta.fallbackReason || 'frontend_backend_unavailable', fallbackChain: response.meta.fallbackChain, error: response.error };
 }
