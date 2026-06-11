@@ -1,72 +1,27 @@
-import { assistantSystemPrompt } from './prompts.ts';
-import type { AiCallOptions, AiProvider } from './providerTypes.ts';
-import { extractJsonObject } from './schemas.ts';
+import type { AiCallInput, ProviderCallOutput } from './types.ts';
 
-export type AssistantPayload = { message: string; mode?: string; context?: { sources?: Array<{ title?: string; excerpt?: string }> }; history?: unknown[] };
-export type GeneratePayload = { type: string; text: string; count?: number; difficulty?: string; sourceMeta?: Record<string, unknown> };
+const sentences = (text: string) => text.split(/[.!?]\s+/).map((x) => x.trim()).filter(Boolean);
+const words = (text: string) => Array.from(new Set((text.toLowerCase().match(/[а-яёa-z0-9-]{4,}/gi) || []).map((x) => x.trim()))).slice(0, 12);
+const json = (value: unknown): ProviderCallOutput => ({ text: JSON.stringify(value) });
 
-const id = (prefix: string) => `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-const sentences = (text: string) => text.split(/[.!?]\s+/).map((s) => s.trim()).filter((s) => s.length > 30);
-const terms = (text: string, count = 8) => Array.from(new Set((text.match(/[А-ЯЁA-Z][а-яёa-z-]+(?:\s+[А-ЯЁA-Z]?[а-яёa-z-]+){0,2}/g) || []).filter((x) => x.length > 4))).slice(0, count);
-
-export async function mockAssistant(payload: AssistantPayload) {
-  const sources = payload.context?.sources?.slice(0, 5) || [];
-  const sourceList = sources.map((s, i) => `${i + 1}. ${s.title || 'Источник'} — ${(s.excerpt || '').slice(0, 240)}`).join('\n');
-  return {
-    answer: `### Локальный учебный ответ\n\n${assistantSystemPrompt}\n\n**Вопрос:** ${payload.message}\n\n${sourceList ? `**Контекст:**\n${sourceList}\n\n` : 'Контекст не передан, поэтому ответ ограничен локальной эвристикой.\n\n'}Mock используется только как fallback: проверьте backend /api/debug/ai-test, ключи Gemini/Groq/Mistral и fallbackChain.`,
-    usedSources: sources,
-    provider: 'mock' as const,
-    model: 'local-retrieval-mock',
-  };
+function mockJson(input: AiCallInput): ProviderCallOutput {
+  const text = input.userPrompt;
+  const terms = words(text).slice(0, 6).map((term) => ({ term, definition: `Учебное определение термина «${term}» на основе импортированного материала.`, expandedExplanation: '', examples: [], tags: ['mock'] }));
+  const flashcards = terms.slice(0, 5).map((t) => ({ question: `Что означает ${t.term}?`, answer: t.definition, explanation: 'Карточка создана локальным fallback-режимом.', difficulty: 'medium', tags: ['mock'] }));
+  const quiz = terms.slice(0, 4).map((t) => ({ type: 'single', question: `Какой термин связан с определением: ${t.definition}`, options: [t.term, 'аллель', 'генотип', 'фенотип'], correctAnswers: [t.term], explanation: 'Вопрос создан локальным fallback-режимом.', difficulty: 'medium', tags: ['mock'] }));
+  const sections = sentences(text).slice(0, 6).map((s, i) => ({ title: `Раздел ${i + 1}`, content: s, pageStart: null, pageEnd: null, tags: ['mock'] }));
+  const diseases = /марфан/i.test(text) ? [{ name: 'Синдром Марфана', alternativeNames: [], inheritanceType: 'аутосомно-доминантный', gene: '', locus: '', mutation: '', pathogenesis: '', symptoms: ['арахнодактилия', 'высокий рост', 'поражение аорты'], diagnostics: '', treatment: '', tags: ['mock'] }] : [];
+  const summary = { title: 'Локальный конспект', content: sentences(text).slice(0, 4).join('. '), keyPoints: words(text).slice(0, 5) };
+  if (input.task === 'split') return json({ sections });
+  if (input.task === 'summary') return json(summary);
+  if (input.task === 'flashcards') return json({ items: flashcards });
+  if (input.task === 'quiz') return json({ items: quiz });
+  if (input.task === 'terms') return json({ items: terms });
+  if (input.task === 'diseases') return json({ items: diseases });
+  return json({ sections, terms, diseases, flashcards, quiz, summary, tags: words(text).slice(0, 8), problems: [] });
 }
 
-export async function mockGenerate(payload: GeneratePayload) {
-  const count = Math.max(1, Math.min(payload.count || 6, 20));
-  const ss = sentences(payload.text);
-  const ts = terms(payload.text, count);
-  if (payload.type === 'terms') return { items: ts.map((term) => ({ id: id('term-ai'), term, definition: `${term} — ключевое понятие из импортированного текста.`, expandedExplanation: 'Проверьте определение перед сохранением.', tags: ['ai'], difficulty: payload.difficulty || 'medium' })) };
-  if (payload.type === 'quiz') return { items: ss.slice(0, count).map((s, i) => ({ id: id('q-ai'), text: `Выберите верное утверждение: ${s.slice(0, 100)}...`, type: i % 2 ? 'single' : 'true_false', options: ['Связано с темой текста', 'Не относится к генетике', 'Всегда митохондриально', 'Не требует анализа'], correctAnswers: ['Связано с темой текста'], correctAnswer: 'Связано с темой текста', explanation: s, difficulty: payload.difficulty || 'medium', tags: ['ai'] })) };
-  if (payload.type === 'diseases') return { items: ts.slice(0, count).map((term) => ({ id: id('dis-ai'), name: term, inheritanceType: 'уточнить', symptoms: ['уточнить по источнику'], pathogenesis: 'Извлечено локальной эвристикой, требуется проверка.', tags: ['ai'] })) };
-  if (payload.type === 'summary' || payload.type === 'study_plan' || payload.type === 'genetic_problem') return { items: [{ id: id('summary-ai'), title: payload.type === 'study_plan' ? 'План повторения' : payload.type === 'genetic_problem' ? 'Учебная задача' : 'Конспект', content: ss.slice(0, count).join('. ') || payload.text.slice(0, 600) }] };
-  return { items: ts.slice(0, count).map((term, i) => ({ id: id('fc-ai'), question: `Что означает «${term}»?`, answer: ss[i % Math.max(1, ss.length)] || term, explanation: 'Создано локальной эвристикой по тексту.', difficulty: payload.difficulty || 'medium', tags: ['ai'] })) };
+export function runMock(input: AiCallInput): ProviderCallOutput {
+  if (input.responseMode === 'json') return mockJson(input);
+  return { text: `### Локальный fallback UrLocalEdu\n\nИспользован mock-provider. Ответ основан на локальном контексте и не является результатом реального AI-provider.\n\n${sentences(input.userPrompt).slice(0, 5).join('. ') || 'Запрос обработан локально.'}` };
 }
-
-export async function mockExtract(text: string, tasks: string[]) {
-  const chunks = text.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
-  const sections = tasks.includes('sections')
-    ? (chunks.length ? chunks : [text]).slice(0, 8).map((content, index) => ({
-        id: id('sec-ai'),
-        topicId: 'user',
-        manualId: 'user',
-        title: content.split('\n')[0]?.slice(0, 80) || `Раздел ${index + 1}`,
-        content,
-        order: index + 1,
-        keyTerms: terms(content, 5),
-        tags: ['ai', 'import'],
-      }))
-    : [];
-  const generated = Object.fromEntries(await Promise.all(tasks.filter((task) => !['sections','tags','summary','problems'].includes(task)).map(async (task) => [task, (await mockGenerate({ type: task === 'quiz' ? 'quiz' : task, text, count: 8 })).items])));
-  return {
-    sections,
-    tags: tasks.includes('tags') ? terms(text, 8).map((x) => x.toLowerCase()) : [],
-    terms: generated.terms || [],
-    diseases: generated.diseases || [],
-    flashcards: generated.flashcards || [],
-    quiz: generated.quiz || [],
-    problems: tasks.includes('problems') ? (await mockGenerate({ type: 'genetic_problem', text, count: 3 })).items : [],
-    summary: tasks.includes('summary') ? (sentences(text).slice(0, 5).join('. ') || text.slice(0, 800)) : '',
-  };
-}
-
-export const mockProvider: AiProvider = {
-  name: 'mock',
-  isConfigured: () => true,
-  getModelCandidates: () => ['local-retrieval-mock'],
-  async callText(prompt: string, _options: AiCallOptions) {
-    return { ok: true, provider: 'mock', model: 'local-retrieval-mock', text: (await mockAssistant({ message: prompt })).answer, triedModels: ['local-retrieval-mock'] };
-  },
-  async callJson(prompt: string, _options: AiCallOptions) {
-    const parsed = extractJsonObject(prompt);
-    return { ok: true, provider: 'mock', model: 'local-retrieval-mock', json: parsed || { items: (await mockGenerate({ type: 'flashcards', text: prompt, count: 6 })).items }, text: JSON.stringify(parsed || {}), triedModels: ['local-retrieval-mock'] };
-  },
-};

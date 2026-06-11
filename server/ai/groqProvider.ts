@@ -1,71 +1,56 @@
-import { jsonSystemPrompt } from './prompts.ts';
-import { extractJsonObject } from './schemas.ts';
-import type { AiCallOptions, AiProvider, AiProviderResult } from './providerTypes.ts';
-import { safeErrorMessage, uniqueStrings } from './providerTypes.ts';
+import { AiProviderError, debugProviderError } from './errors.ts';
+import type { AiProviderAdapter, ProviderCallInput, ProviderCallOutput } from './types.ts';
 
-const GROQ_DEFAULTS = ['llama-3.3-70b-versatile','llama-3.1-8b-instant'];
+const clean = (value?: string) => String(value || '').trim();
+const unique = (items: Array<string | undefined>) => Array.from(new Set(items.map(clean).filter(Boolean)));
 
-function parseError(status: number, body: string) {
+function parseError(status: number, bodyText: string) {
   try {
-    const json = JSON.parse(body) as { error?: { message?: string; type?: string; code?: string } };
-    return `groq_http_${status}${json.error?.code ? `:${json.error.code}` : ''}${json.error?.message ? `:${json.error.message}` : ''}`;
-  } catch {
-    return `groq_http_${status}:${body.slice(0, 500)}`;
-  }
+    const json = JSON.parse(bodyText) as { error?: { message?: string; code?: string; type?: string } };
+    return { code: json.error?.code || json.error?.type || String(status), message: json.error?.message || `Groq HTTP ${status}` };
+  } catch { return { code: String(status), message: bodyText.slice(0, 500) || `Groq HTTP ${status}` }; }
 }
 
-async function requestGroq(model: string, prompt: string, options: AiCallOptions, responseFormat: boolean) {
+async function requestGroq(input: ProviderCallInput, responseFormat: boolean): Promise<ProviderCallOutput> {
   const key = process.env.GROQ_API_KEY;
-  if (!key) return { ok: false as const, error: 'groq_missing_key', status: 401 };
+  if (!key) throw new AiProviderError('Groq API key is not configured', { provider: 'groq', model: input.model, status: 401, code: 'groq_missing_key' });
   const body: Record<string, unknown> = {
-    model,
-    messages: [{ role: 'system', content: options.forceJson ? jsonSystemPrompt : 'Ты учебный ассистент по медицинской генетике. Отвечай на русском.' }, { role: 'user', content: prompt }],
-    temperature: options.temperature ?? (options.forceJson ? 0.15 : 0.25),
-    max_completion_tokens: options.maxTokens ?? 4096,
-    top_p: 0.9,
+    model: input.model,
+    messages: [{ role: 'system', content: input.systemPrompt }, { role: 'user', content: responseFormat ? input.userPrompt : `${input.userPrompt}\n\nЕсли нужен JSON, верни только валидный JSON без markdown.` }],
+    temperature: input.temperature ?? (input.responseMode === 'json' ? 0.15 : 0.2),
+    max_completion_tokens: input.maxTokens ?? 4096,
     stream: false,
   };
-  if (responseFormat) body.response_format = { type: 'json_object' };
+  if (input.responseMode === 'json' && responseFormat) body.response_format = { type: 'json_object' };
   const response = await fetch('https://api.groq.com/openai/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` }, body: JSON.stringify(body) });
-  const text = await response.text();
-  if (!response.ok) return { ok: false as const, error: parseError(response.status, text), status: response.status };
+  const bodyText = await response.text();
+  if (!response.ok) {
+    const parsed = parseError(response.status, bodyText);
+    const error = new AiProviderError('Groq request failed', { provider: 'groq', model: input.model, status: response.status, code: parsed.code, bodyText, safeMessage: parsed.message });
+    debugProviderError(error);
+    throw error;
+  }
   try {
-    const data = JSON.parse(text) as { choices?: Array<{ message?: { content?: string } }> };
-    const content = data.choices?.[0]?.message?.content?.trim() || '';
-    return content ? { ok: true as const, text: content, status: response.status } : { ok: false as const, error: 'groq_empty_response', status: response.status };
-  } catch {
-    return { ok: false as const, error: 'groq_invalid_json_response', status: response.status };
+    const data = JSON.parse(bodyText) as { choices?: Array<{ message?: { content?: string } }>; usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } };
+    const text = data.choices?.[0]?.message?.content?.trim() || '';
+    if (!text) throw new Error('groq_empty_response');
+    return { text, usage: { inputTokens: data.usage?.prompt_tokens, outputTokens: data.usage?.completion_tokens, totalTokens: data.usage?.total_tokens } };
+  } catch (error) {
+    if (error instanceof Error && error.message === 'groq_empty_response') throw new AiProviderError('groq_empty_response', { provider: 'groq', model: input.model, status: response.status, bodyText });
+    throw new AiProviderError('Groq returned invalid JSON envelope', { provider: 'groq', model: input.model, status: response.status, bodyText });
   }
 }
 
-async function call(prompt: string, options: AiCallOptions): Promise<AiProviderResult> {
-  const triedModels: string[] = [];
-  let lastError = 'groq_no_model_succeeded';
-  let lastStatus: number | undefined;
-  for (const model of groqProvider.getModelCandidates(options.task, options.preferredModel)) {
-    triedModels.push(model);
-    try {
-      const first = options.forceJson ? await requestGroq(model, prompt, options, true) : await requestGroq(model, prompt, options, false);
-      const result = options.forceJson && !first.ok && first.status === 400 ? await requestGroq(model, prompt, options, false) : first;
-      if (result.ok) return { ok: true, provider: 'groq', model, text: result.text, triedModels };
-      lastError = result.error;
-      lastStatus = result.status;
-    } catch (error) {
-      lastError = safeErrorMessage(error, 'groq_fetch_failed');
-    }
-  }
-  return { ok: false, provider: 'groq', model: triedModels.at(-1) || 'unknown', providerError: lastError, triedModels, rawStatus: lastStatus };
-}
-
-export const groqProvider: AiProvider = {
+export const groqProvider: AiProviderAdapter = {
   name: 'groq',
   isConfigured: () => Boolean(process.env.GROQ_API_KEY),
-  getModelCandidates: (_task, preferredModel) => uniqueStrings([preferredModel, process.env.GROQ_MODEL_PRIMARY, process.env.GROQ_MODEL_FALLBACK, ...GROQ_DEFAULTS]),
-  callText: (prompt, options) => call(prompt, { ...options, forceJson: false }),
-  async callJson(prompt, options) {
-    const result = await call(prompt, { ...options, forceJson: true });
-    if (!result.ok) return result;
-    const json = extractJsonObject(result.text || '');
-    return json ? { ...result, json } : { ...result, ok: false, providerError: 'groq_json_parse_failed' };
+  getModels(preferredModel?: string) {
+    const primary = clean(preferredModel) || clean(process.env.GROQ_MODEL_PRIMARY) || 'llama-3.3-70b-versatile';
+    const fallback = clean(process.env.GROQ_MODEL_FALLBACK);
+    return { primary, fallback: fallback || undefined, candidates: unique([primary, fallback]) };
+  },
+  async call(input) {
+    try { return await requestGroq(input, input.responseMode === 'json'); }
+    catch (error) { if (input.responseMode === 'json' && error instanceof AiProviderError && error.status === 400) return requestGroq(input, false); throw error; }
   },
 };

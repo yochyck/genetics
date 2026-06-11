@@ -1,20 +1,33 @@
 import { useEffect, useState } from 'react';
 import { AiChatSession, CourseSection, DiseaseEntry, EditHistoryItem, Flashcard, GlossaryTerm, Pedigree, QuizQuestion, SimulatorResult, UserMaterial, UserProgress } from './types';
 
-export const STORAGE_KEYS = {
+export const STORAGE_SCHEMA_VERSION = 1;
+export const LEGACY_STORAGE_KEYS = {
   progress: 'genetics_user_progress', editedSections: 'genetics_edited_sections', userMaterials: 'genetics_user_materials',
   flashcards: 'genetics_generated_flashcards', quizzes: 'genetics_generated_quizzes', glossary: 'genetics_user_glossary',
   diseases: 'genetics_user_diseases', editHistory: 'genetics_edit_history', pedigrees: 'genetics_pedigrees',
   simulator: 'genetics_simulator_history', chats: 'genetics_ai_chat_sessions', settings: 'genetics_settings'
 } as const;
+export const STORAGE_KEYS = {
+  progress: 'urlocaledu:v1:progress', editedSections: 'urlocaledu:v1:sections', userMaterials: 'urlocaledu:v1:sources',
+  flashcards: 'urlocaledu:v1:flashcards', quizzes: 'urlocaledu:v1:quizzes', glossary: 'urlocaledu:v1:glossary',
+  diseases: 'urlocaledu:v1:references', editHistory: 'urlocaledu:v1:editHistory', pedigrees: 'urlocaledu:v1:pedigrees',
+  simulator: 'urlocaledu:v1:simulator', chats: 'urlocaledu:v1:aiHistory', settings: 'urlocaledu:v1:settings',
+  workspaces: 'urlocaledu:v1:workspaces', courses: 'urlocaledu:v1:courses', migration: 'urlocaledu:v1:migration', notes: 'urlocaledu:v1:notes'
+} as const;
 
 const defaultProgress: UserProgress = { readSections: [], flashcardScores: {}, quizScores: {}, quizResults: {} };
-export function clearCorruptedStorageKey(key: string) { localStorage.removeItem(key); }
-export function safeLoad<T>(key: string, fallback: T): T { try { const raw = localStorage.getItem(key); if (!raw) return fallback; const parsed = JSON.parse(raw) as unknown; if (Array.isArray(fallback)) return (Array.isArray(parsed) ? parsed : fallback) as T; if (fallback && typeof fallback === 'object') return (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback) as T; return parsed as T; } catch { clearCorruptedStorageKey(key); return fallback; } }
-export function safeSave<T>(key: string, value: T) { try { localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { console.error(`Cannot save ${key}`, e); return false; } }
-export function exportAllUserData() { const data: Record<string, unknown> = {}; Object.values(STORAGE_KEYS).forEach(k => data[k] = safeLoad(k, null)); return JSON.stringify({ exportedAt: new Date().toISOString(), data }, null, 2); }
+const hasStorage = () => typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+export function backupRawStorage(key: string, raw: string) { if (!hasStorage()) return; try { localStorage.setItem(`urlocaledu:backup:${Date.now()}:${key}`, raw); } catch { /* ignore backup quota failures */ } }
+export function clearCorruptedStorageKey(key: string) { if (!hasStorage()) return; const raw = localStorage.getItem(key); if (raw) backupRawStorage(key, raw); localStorage.removeItem(key); }
+export function safeLoad<T>(key: string, fallback: T): T { try { if (!hasStorage()) return fallback; const raw = localStorage.getItem(key); if (!raw) return fallback; const parsed = JSON.parse(raw) as unknown; if (Array.isArray(fallback)) return (Array.isArray(parsed) ? parsed : fallback) as T; if (fallback && typeof fallback === 'object') return (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : fallback) as T; return parsed as T; } catch { clearCorruptedStorageKey(key); return fallback; } }
+export function safeSave<T>(key: string, value: T) { try { if (!hasStorage()) return false; localStorage.setItem(key, JSON.stringify(value)); return true; } catch (e) { console.error(`Cannot save ${key}`, e); return false; } }
+export function migrateLegacyGeneticsEduData() { if (!hasStorage()) return false; if (localStorage.getItem(STORAGE_KEYS.migration)) return false; const snapshot: Record<string, string> = {}; Object.entries(LEGACY_STORAGE_KEYS).forEach(([name, key]) => { const raw = localStorage.getItem(key); if (raw) snapshot[name] = raw; }); if (Object.keys(snapshot).length) backupRawStorage('genetics-legacy-all', JSON.stringify(snapshot)); Object.entries(LEGACY_STORAGE_KEYS).forEach(([name, legacyKey]) => { const newKey = (STORAGE_KEYS as Record<string, string>)[name]; if (newKey && !localStorage.getItem(newKey)) { const raw = localStorage.getItem(legacyKey); if (raw) localStorage.setItem(newKey, raw); } }); const now = new Date().toISOString(); if (!localStorage.getItem(STORAGE_KEYS.workspaces)) safeSave(STORAGE_KEYS.workspaces, [{ id: 'workspace-default', title: 'Локальное пространство', createdAt: now, updatedAt: now }]); if (!localStorage.getItem(STORAGE_KEYS.courses)) safeSave(STORAGE_KEYS.courses, [{ id: 'course-genetics-default', workspaceId: 'workspace-default', subjectId: 'genetics', title: 'Генетика', description: 'Legacy GeneticsEdu course migrated to UrLocalEdu.', icon: '🧬', color: 'indigo', tags: ['genetics'], createdAt: now, updatedAt: now }]); safeSave(STORAGE_KEYS.migration, { version: STORAGE_SCHEMA_VERSION, migratedAt: now, legacyKeys: Object.keys(snapshot) }); return true; }
+export function migrateUserData(oldData?: unknown) { migrateLegacyGeneticsEduData(); return oldData; }
+export function exportAllUserData() { migrateLegacyGeneticsEduData(); const data: Record<string, unknown> = {}; Object.values(STORAGE_KEYS).forEach(k => data[k] = safeLoad(k, null)); return JSON.stringify({ exportedAt: new Date().toISOString(), schemaVersion: STORAGE_SCHEMA_VERSION, data }, null, 2); }
 export function importAllUserData(json: string) { try { const parsed = JSON.parse(json); const data = parsed?.data ?? parsed; if (!data || typeof data !== 'object' || Array.isArray(data)) return false; Object.values(STORAGE_KEYS).forEach(k => { if (k in data) safeSave(k, (data as Record<string, unknown>)[k]); }); return true; } catch (e) { console.error('Cannot import user data', e); return false; } }
-export function resetUserData() { Object.values(STORAGE_KEYS).forEach(k => localStorage.removeItem(k)); }
+export function resetUserData() { if (!hasStorage()) return; Object.values(STORAGE_KEYS).forEach(k => localStorage.removeItem(k)); }
+if (typeof window !== 'undefined') migrateLegacyGeneticsEduData();
 
 export const getUserEditedSections = (): Record<string, CourseSection> => safeLoad(STORAGE_KEYS.editedSections, {});
 export const saveEditedSection = (section: CourseSection) => { const sections = getUserEditedSections(); const before = sections[section.id]; const after = { ...section, userEdited: true, updatedAt: Date.now() }; sections[section.id] = after; safeSave(STORAGE_KEYS.editedSections, sections); addToEditHistory({ id: crypto.randomUUID(), entityType: 'section', entityId: section.id, before, after, changedAt: Date.now() }); };
