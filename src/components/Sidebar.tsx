@@ -1,0 +1,8 @@
+import React from 'react';
+import clsx from 'clsx';
+import { Activity, BookA, BookOpen, BrainCircuit, Database, Dna, Edit3, FileInput, Home, Library, MessageCircle, Network, Sparkles, Stethoscope } from 'lucide-react';
+
+export const Sidebar: React.FC<{currentView:string; navigateTo:(view:string)=>void; isOpen:boolean; setIsOpen:(o:boolean)=>void}> = ({currentView,navigateTo,isOpen}) => {
+ const groups=[['Обучение',[['home','Главная',Home],['material','Курс / материалы',BookOpen],['sources','Методички',Library]]],['Практика',[['flashcards','Карточки',BrainCircuit],['quizzes','Тесты и задачи',Activity],['simulator','Симулятор Пеннета',Dna],['pedigree','Родословные',Network]]],['База знаний',[['glossary','Глоссарий',BookA],['diseases','Болезни',Stethoscope],['editor','Редактор базы',Database]]],['Pro / ИИ',[['assistant','ИИ-ассистент',MessageCircle],['aigen','ИИ-генератор',Sparkles],['import','Импорт',FileInput]]]] as const;
+ return <aside className={clsx('sidebar',isOpen&&'sidebar-open')}><div className="sidebar-brand"><div className="sidebar-brand-icon"><Dna size={24}/></div><div><h1>Genetics<span>Edu</span></h1><p>medical genetics lab</p></div></div><nav className="sidebar-nav" aria-label="Основная навигация">{groups.map(([title,items])=><section key={title} className="sidebar-section"><h2 className="sidebar-section-title">{title}</h2><ul>{items.map(([id,label,Icon])=><li key={id}><button type="button" onClick={()=>navigateTo(id)} className={clsx('sidebar-link', currentView===id&&'active')} aria-current={currentView===id?'page':undefined}><Icon size={18}/><span>{label}</span></button></li>)}</ul></section>)}</nav><footer className="sidebar-footer"><Edit3 size={14}/><span>© 2026 GeneticsEdu<br/>Связанная база знаний</span></footer></aside>;
+};
