@@ -1,6 +1,7 @@
 import { assistantSystemPrompt } from './prompts.ts';
+import type { AiCallOptions, AiProvider } from './providerTypes.ts';
+import { extractJsonObject } from './schemas.ts';
 
-export type AiProviderName = 'gemini' | 'openai' | 'mock';
 export type AssistantPayload = { message: string; mode?: string; context?: { sources?: Array<{ title?: string; excerpt?: string }> }; history?: unknown[] };
 export type GeneratePayload = { type: string; text: string; count?: number; difficulty?: string; sourceMeta?: Record<string, unknown> };
 
@@ -12,7 +13,7 @@ export async function mockAssistant(payload: AssistantPayload) {
   const sources = payload.context?.sources?.slice(0, 5) || [];
   const sourceList = sources.map((s, i) => `${i + 1}. ${s.title || 'Источник'} — ${(s.excerpt || '').slice(0, 240)}`).join('\n');
   return {
-    answer: `### Локальный учебный ответ\n\n${assistantSystemPrompt}\n\n**Вопрос:** ${payload.message}\n\n${sourceList ? `**Контекст:**\n${sourceList}\n\n` : 'Контекст не передан, поэтому ответ ограничен локальной эвристикой.\n\n'}Если нужен ответ реальной LLM, запустите backend и задайте GEMINI_API_KEY или OPENAI_API_KEY в server-side .env.`,
+    answer: `### Локальный учебный ответ\n\n${assistantSystemPrompt}\n\n**Вопрос:** ${payload.message}\n\n${sourceList ? `**Контекст:**\n${sourceList}\n\n` : 'Контекст не передан, поэтому ответ ограничен локальной эвристикой.\n\n'}Mock используется только как fallback: проверьте backend /api/debug/ai-test, ключи Gemini/Groq/Mistral и fallbackChain.`,
     usedSources: sources,
     provider: 'mock' as const,
     model: 'local-retrieval-mock',
@@ -26,7 +27,7 @@ export async function mockGenerate(payload: GeneratePayload) {
   if (payload.type === 'terms') return { items: ts.map((term) => ({ id: id('term-ai'), term, definition: `${term} — ключевое понятие из импортированного текста.`, expandedExplanation: 'Проверьте определение перед сохранением.', tags: ['ai'], difficulty: payload.difficulty || 'medium' })) };
   if (payload.type === 'quiz') return { items: ss.slice(0, count).map((s, i) => ({ id: id('q-ai'), text: `Выберите верное утверждение: ${s.slice(0, 100)}...`, type: i % 2 ? 'single' : 'true_false', options: ['Связано с темой текста', 'Не относится к генетике', 'Всегда митохондриально', 'Не требует анализа'], correctAnswers: ['Связано с темой текста'], correctAnswer: 'Связано с темой текста', explanation: s, difficulty: payload.difficulty || 'medium', tags: ['ai'] })) };
   if (payload.type === 'diseases') return { items: ts.slice(0, count).map((term) => ({ id: id('dis-ai'), name: term, inheritanceType: 'уточнить', symptoms: ['уточнить по источнику'], pathogenesis: 'Извлечено локальной эвристикой, требуется проверка.', tags: ['ai'] })) };
-  if (payload.type === 'summary' || payload.type === 'study_plan') return { items: [{ id: id('summary-ai'), title: payload.type === 'study_plan' ? 'План повторения' : 'Конспект', content: ss.slice(0, count).join('. ') || payload.text.slice(0, 600) }] };
+  if (payload.type === 'summary' || payload.type === 'study_plan' || payload.type === 'genetic_problem') return { items: [{ id: id('summary-ai'), title: payload.type === 'study_plan' ? 'План повторения' : payload.type === 'genetic_problem' ? 'Учебная задача' : 'Конспект', content: ss.slice(0, count).join('. ') || payload.text.slice(0, 600) }] };
   return { items: ts.slice(0, count).map((term, i) => ({ id: id('fc-ai'), question: `Что означает «${term}»?`, answer: ss[i % Math.max(1, ss.length)] || term, explanation: 'Создано локальной эвристикой по тексту.', difficulty: payload.difficulty || 'medium', tags: ['ai'] })) };
 }
 
@@ -44,12 +45,28 @@ export async function mockExtract(text: string, tasks: string[]) {
         tags: ['ai', 'import'],
       }))
     : [];
-  const generated = Object.fromEntries(await Promise.all(tasks.filter((task) => task !== 'sections').map(async (task) => [task, (await mockGenerate({ type: task === 'quiz' ? 'quiz' : task, text, count: 8 })).items])));
+  const generated = Object.fromEntries(await Promise.all(tasks.filter((task) => !['sections','tags','summary','problems'].includes(task)).map(async (task) => [task, (await mockGenerate({ type: task === 'quiz' ? 'quiz' : task, text, count: 8 })).items])));
   return {
     sections,
+    tags: tasks.includes('tags') ? terms(text, 8).map((x) => x.toLowerCase()) : [],
     terms: generated.terms || [],
     diseases: generated.diseases || [],
     flashcards: generated.flashcards || [],
     quiz: generated.quiz || [],
+    problems: tasks.includes('problems') ? (await mockGenerate({ type: 'genetic_problem', text, count: 3 })).items : [],
+    summary: tasks.includes('summary') ? (sentences(text).slice(0, 5).join('. ') || text.slice(0, 800)) : '',
   };
 }
+
+export const mockProvider: AiProvider = {
+  name: 'mock',
+  isConfigured: () => true,
+  getModelCandidates: () => ['local-retrieval-mock'],
+  async callText(prompt: string, _options: AiCallOptions) {
+    return { ok: true, provider: 'mock', model: 'local-retrieval-mock', text: (await mockAssistant({ message: prompt })).answer, triedModels: ['local-retrieval-mock'] };
+  },
+  async callJson(prompt: string, _options: AiCallOptions) {
+    const parsed = extractJsonObject(prompt);
+    return { ok: true, provider: 'mock', model: 'local-retrieval-mock', json: parsed || { items: (await mockGenerate({ type: 'flashcards', text: prompt, count: 6 })).items }, text: JSON.stringify(parsed || {}), triedModels: ['local-retrieval-mock'] };
+  },
+};
